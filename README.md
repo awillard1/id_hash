@@ -2,7 +2,12 @@
 ```
 python3 id_hash/identify_hash.py --value-file id_hash/known.txt --hash-file id_hash/hash.txt --try-external --external-verbose --john-fork 28
 ```
-
+##### If you are going to user --john-fork
+Please understand what your processor is capable of. The system this was tested on can --fork to 32; however, that would make the system come to a halt.
+###### Run the following to see how many threads your system is capable of:
+```
+cat /proc/cpuinfo | grep processor | wc -l
+```
 # Ubuntu Directions
 
 ##### 1) System essentials (build tools only needed if a wheel isn’t available)
