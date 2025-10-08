@@ -17,7 +17,7 @@ sudo apt install -y python3 python3-pip python3-venv build-essential python3-dev
 ```
 ##### 2) External tools
 ```
-sudo apt install -y hashcat john
+sudo apt install -y hashcat
 ```
 ##### 3) Python packages (local algs + extras used by the script)
 ```
