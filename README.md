@@ -4,6 +4,12 @@ python3 id_hash/identify_hash.py --value-file id_hash/known.txt --hash-file id_h
 ```
 ##### If you are going to user --john-fork
 Please understand what your processor is capable of. The system this was tested on can --fork to 32; however, that would make the system come to a halt.
+
+##### The --value-file
+This file can be the output from the burp extension at https://github.com/awillard1/burp-extensions/blob/main/id_hash.py or https://github.com/awillard1/burp-extensions/blob/main/id_hash_advanced.py
+
+The file could also be any wordlist you want to use against the --hash-file.
+
 ###### Run the following to see how many threads your system is capable of:
 ```
 cat /proc/cpuinfo | grep processor | wc -l
