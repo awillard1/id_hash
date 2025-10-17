@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-# identify_hash.py v6.0
+# -*- coding: utf-8 -*-
+# identify_hash.py v6.1-multi
 # - Local: hashlib + extras (blake3, pycryptodome) + passlib + optional non-crypto
 # - External (--try-external): Try *every* Hashcat mode and *every* John format
 #   using your provided files: --valueof known.txt (wordlist), --hashvalue hash.txt (hashes)
+#   >>> Now aggregates and reports ALL cracked hashes (not just the first).
 
-import argparse, base64, binascii, hashlib, re, sys, subprocess, tempfile, shutil, shlex
+import argparse, base64, binascii, hashlib, re, sys, subprocess, tempfile, shutil
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -254,7 +256,7 @@ def try_noncrypto(candidate_bytes: bytes, candidate_text: Optional[str], target_
             return m
     return None
 
-# ===================== External tools: Hashcat (ALL modes) & John (ALL formats) =====================
+# ===================== External tools helpers =====================
 
 def tool_exists(name: str) -> bool:
     return shutil.which(name) is not None
@@ -283,15 +285,17 @@ def parse_hashcat_modes() -> Dict[str,str]:
     except Exception:
         return {}
 
-def try_hashcat_all_modes_files(wordlist_path: Path, hash_path: Path, verbose: bool=False) -> Optional[str]:
+# Return a mapping: hash -> {"plaintext": str, "modes": set([("m123","Name"), ...])}
+def try_hashcat_all_modes_files_collect(wordlist_path: Path, hash_path: Path, verbose: bool=False) -> Dict[str, Dict[str, object]]:
+    results: Dict[str, Dict[str, object]] = {}
     if not tool_exists("hashcat"):
         print("[external] Hashcat not found on PATH.")
-        return None
+        return results
     modes = parse_hashcat_modes()
     total = len(modes)
     if not modes:
         print("[external] Hashcat: no modes discovered.")
-        return None
+        return results
 
     print(f"[external] Hashcat detected. Modes available: {total}")
     print(f"[external] Hashcat: starting runs with wordlist={wordlist_path} hashes={hash_path}")
@@ -300,6 +304,8 @@ def try_hashcat_all_modes_files(wordlist_path: Path, hash_path: Path, verbose: b
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         out = td / "out.txt"
+        if out.exists():
+            out.unlink()
         for i, mode in enumerate(sorted(modes.keys(), key=lambda x: int(x)), start=1):
             try:
                 if verbose or i == 1 or i % 50 == 0 or i == total:
@@ -313,16 +319,26 @@ def try_hashcat_all_modes_files(wordlist_path: Path, hash_path: Path, verbose: b
                     str(hash_path), str(wordlist_path)
                 ]
                 subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
                 if out.exists():
                     data = out.read_text(encoding="utf-8", errors="ignore")
                     if data.strip():
-                        cracked = data.strip().splitlines()[0].strip()
-                        print(f"[external] Hashcat: cracked with m{mode} - {modes.get(mode,'?')}")
-                        return f"HASHCAT|m{mode}|{modes.get(mode,'?')}|{cracked}"
+                        for line in data.splitlines():
+                            if ":" not in line:
+                                continue
+                            h, plain = line.split(":", 1)
+                            h = h.strip(); plain = plain.strip()
+                            if not h or not plain:
+                                continue
+                            entry = results.setdefault(h, {"plaintext": plain, "modes": set()})
+                            entry["modes"].add((f"m{mode}", modes.get(mode, "?")))
+                    try:
+                        out.write_text("", encoding="utf-8")
+                    except Exception:
+                        pass
             except Exception:
                 continue
-    print("[external] Hashcat: completed without a crack.")
-    return None
+    return results
 
 def parse_john_formats() -> List[str]:
     if not tool_exists("john"):
@@ -352,15 +368,17 @@ def parse_john_formats() -> List[str]:
             pass
     return sorted(fmts)
 
-def try_john_all_formats_files(wordlist_path: Path, hash_path: Path, fork: Optional[int], verbose: bool=False) -> Optional[str]:
+# Return a mapping: key -> {"plaintext": str, "formats": set([...])}
+def try_john_all_formats_files_collect(wordlist_path: Path, hash_path: Path, fork: Optional[int], verbose: bool=False) -> Dict[str, Dict[str, object]]:
+    results: Dict[str, Dict[str, object]] = {}
     if not tool_exists("john"):
         print("[external] John the Ripper not found on PATH.")
-        return None
+        return results
     formats = parse_john_formats()
     total = len(formats)
     if not formats:
         print("[external] John: no formats discovered.")
-        return None
+        return results
 
     print(f"[external] John the Ripper detected. Formats available: {total}")
     print(f"[external] John: starting runs with wordlist={wordlist_path} hashes={hash_path}")
@@ -377,23 +395,28 @@ def try_john_all_formats_files(wordlist_path: Path, hash_path: Path, fork: Optio
                 if fork and fork > 1:
                     cmd.insert(1, f"--fork={fork}")
                 subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                # Show results
+
                 show = subprocess.run(
                     ["john", "--show", f"--format={fmt}", f"--pot={potfile}", str(hash_path)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                 )
                 out = (show.stdout or "").splitlines()
-                # Look for "hash:plaintext" or similar
+
                 for line in out:
-                    if ":" in line and not line.lower().endswith("password hashes cracked, 0 left"):
-                        cracked = line.split(":")[-1].strip()
-                        if cracked:
-                            print(f"[external] John: cracked with format {fmt}")
-                            return f"JOHN|{fmt}|{cracked}"
+                    if not line or "password hashes cracked" in line.lower():
+                        continue
+                    if ":" not in line:
+                        continue
+                    left, plaintext = line.rsplit(":", 1)
+                    plaintext = plaintext.strip()
+                    left = left.strip()
+                    if not plaintext:
+                        continue
+                    entry = results.setdefault(left, {"plaintext": plaintext, "formats": set()})
+                    entry["formats"].add(fmt)
             except Exception:
                 continue
-    print("[external] John: completed without a crack.")
-    return None
+    return results
 
 def find_line_number_in_file(path: Path, plaintext: str) -> Optional[int]:
     try:
@@ -415,27 +438,23 @@ def first_match_for_value(candidate_bytes: bytes, candidate_text_or_none: Option
     tbytes = target_bytes_from_hex(target_str) if target_kind == 'hex' else target_bytes_from_b64(target_str)
     target_len_bytes = len(tbytes) if tbytes is not None else None
 
-    # 0) PASSLIB formats
     tested += 1
     pl = try_passlib(candidate_text_or_none, target_str)
     if pl:
         return pl, tested
 
-    # 1) HASHLIB algorithms
     for alg in algorithms_order():
         tested += 1
         m = try_hashlib_alg(alg, candidate_bytes, target_str, target_kind, target_len_bytes)
         if m:
             return m, tested
 
-    # 2) EXTRA algorithms
     for (name, func, varlen, src) in extra_algorithms():
         tested += 1
         m = try_extra_alg(name, func, candidate_bytes, target_str, target_kind, target_len_bytes, varlen, src)
         if m:
             return m, tested
 
-    # 3) NON-CRYPTO (optional)
     if enable_noncrypto:
         tested += 1
         m = try_noncrypto(candidate_bytes, candidate_text_or_none, target_str, target_kind)
@@ -462,12 +481,8 @@ def detect_text_encoding(b: bytes) -> Optional[str]:
         return None
 
 def build_candidates(value_file_bytes: bytes) -> List[Tuple[int, str, str, bytes, Optional[str]]]:
-    """
-    Returns list of (line_no, encoding_label, text_preview, candidate_bytes, candidate_text_if_utf8_or_detected)
-    Tries UTF-8 and original-encoding bytes where applicable; dedupes by bytes.
-    """
     enc = detect_text_encoding(value_file_bytes)
-    candidates: List[Tuple[int,str,str,bytes,Optional[str]]] = []
+    candidates = []
 
     if enc:
         text = value_file_bytes.decode(enc, errors='strict')
@@ -494,7 +509,6 @@ def build_candidates(value_file_bytes: bytes) -> List[Tuple[int, str, str, bytes
                 preview = ln.decode('utf-8', errors='replace')
             candidates.append((idx, 'raw-bytes', preview, ln, line_text))
 
-    # Deduplicate by bytes while preserving order
     seen = set(); uniq=[]
     for item in candidates:
         key = item[3]
@@ -508,19 +522,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Identify which hash matches a target (local algs; Hashcat ALL modes & John ALL formats with --try-external).")
     p.add_argument("--valueof",   type=Path, help="File with VALUEs (one per line) — will be used as wordlist for external tools.")
     p.add_argument("--hashvalue", type=Path, help="File with TARGET digest(s) — will be used as hash file for external tools.")
-    # Legacy aliases / positionals still supported:
     p.add_argument("--value-file", type=Path, help="(Legacy) same as --valueof.")
     p.add_argument("--hash-file",  type=Path, help="(Legacy) same as --hashvalue.")
     p.add_argument("value", nargs='?', default="", help="(Legacy) single value as text.")
     p.add_argument("hash_value", nargs='?', default="", help="(Legacy) hash string.")
-    # External toggles
     p.add_argument("--try-external", action="store_true",
                    help="Try ALL Hashcat modes and ALL John formats using your files as wordlist/hashes.")
     p.add_argument("--external-verbose", action="store_true",
                    help="Print per-mode/per-format progress (very chatty).")
     p.add_argument("--john-fork", type=int, default=None,
                    help="Pass --fork N to John for parallelism.")
-    # Misc
     p.add_argument("--no-noncrypto", action="store_true",
                    help="Disable non-crypto hashes (mmh3/xxhash). Enabled by default.")
     return p
@@ -528,7 +539,8 @@ def build_parser() -> argparse.ArgumentParser:
 def resolve_inputs(args):
     """
     Returns:
-      (value_file_bytes, target_text, mode_label, value_path_or_None, hash_path_or_None)
+      (value_file_bytes, hash_text_or_single, mode_label, value_path_or_None, hash_path_or_None)
+      - hash_text_or_single: if file mode -> full text of file (multiple lines), otherwise single string
     """
     if args.valueof or args.hashvalue:
         if not (args.valueof and args.hashvalue):
@@ -536,32 +548,31 @@ def resolve_inputs(args):
         vb = args.valueof.read_bytes()
         ht = args.hashvalue.read_text(encoding="utf-8", errors="strict")
         return vb, ht, "fileonly", args.valueof, args.hashvalue
+
     if args.value_file or args.hash_file:
         if not (args.value_file and args.hash_file):
             raise SystemExit("Use BOTH --value-file and --hash-file together.")
         vb = args.value_file.read_bytes()
         ht = args.hash_file.read_text(encoding="utf-8", errors="strict")
         return vb, ht, "legacy-files", args.value_file, args.hash_file
+
     if not (args.value and args.hash_value):
         raise SystemExit("No inputs provided. Use --valueof/--hashvalue or legacy flags/positionals.")
     return args.value.encode('utf-8'), args.hash_value, "positionals", None, None
 
 def main() -> None:
-    print("identify_hash.py v6.0 (local algs; Hashcat ALL modes & John ALL formats with --try-external)")
+    print("identify_hash.py v6.1 (local algs; Hashcat ALL modes & John ALL formats with --try-external) - multi-hash & multi-crack reporting")
     parser = build_parser(); args = parser.parse_args()
-    value_file_bytes, target_text, mode, value_path, hash_path = resolve_inputs(args)
+    value_file_bytes, hash_text_or_single, mode, value_path, hash_path = resolve_inputs(args)
     enable_noncrypto = not args.no_noncrypto
 
-    # Target info (for variable-length digests in local checks)
-    target_kind = detect_target_format(target_text)
-    tbytes = target_bytes_from_hex(target_text) if target_kind == 'hex' else target_bytes_from_b64(target_text)
-    target_len_bytes = len(tbytes) if tbytes is not None else None
-    if target_len_bytes is not None:
-        print(f"Target digest length: {target_len_bytes} bytes ({'hex' if target_kind=='hex' else 'base64'})")
+    if mode in ("fileonly", "legacy-files"):
+        target_lines = [l.strip() for l in hash_text_or_single.splitlines() if l.strip()]
+        if not target_lines:
+            raise SystemExit("Hash file contained no non-empty lines.")
     else:
-        print("Target digest length: unknown (could not parse target fully)")
+        target_lines = [hash_text_or_single.strip()]
 
-    # Build local candidates
     candidates = build_candidates(value_file_bytes)
     print(f"Candidates after encoding handling: {len(candidates)}")
     for i, (ln, enc_lbl, txt, bs, tx) in enumerate(candidates[:3], start=1):
@@ -571,59 +582,92 @@ def main() -> None:
     if not candidates:
         raise SystemExit("No non-empty lines found in the value file.")
 
-    # Try local algorithms first (fast), stop on first match
-    total_steps = 0
-    for line_no, enc_label, preview_text, cand_bytes, cand_text in candidates:
-        m, steps = first_match_for_value(cand_bytes, cand_text, target_text, enable_noncrypto)
-        total_steps += steps
-        if m:
-            print("\n=== MATCH FOUND ===")
-            print(f"Line number            : {line_no}")
-            print(f"Encoding used for bytes: {enc_label}")
-            print(f"Candidate length       : {len(cand_bytes)} bytes")
-            print("Matched value (verbatim bytes): ", end=""); sys.stdout.flush()
-            sys.stdout.buffer.write(cand_bytes + b"\n")
-            print(f"Matched value (utf8/escaped)  : {repr(preview_text)}")
-            print(f"Matched value (hex)           : {binascii.hexlify(cand_bytes).decode('ascii')}")
-            print(f"Matched algorithm             : {m}")
-            print(f"Total steps (until match)     : {total_steps}")
-            return
+    overall_total_steps = 0
+    any_local_matches = False
 
-    # External ALL-modes/formats phase (only if requested and only with file inputs)
+    for tidx, target_text in enumerate(target_lines, start=1):
+        print("\n" + ("="*60))
+        print(f"Processing target #{tidx}: {repr(target_text[:120])}")
+        target_kind = detect_target_format(target_text)
+        tbytes = target_bytes_from_hex(target_text) if target_kind == 'hex' else target_bytes_from_b64(target_text)
+        target_len_bytes = len(tbytes) if tbytes is not None else None
+        if target_len_bytes is not None:
+            print(f"Target digest length: {target_len_bytes} bytes ({'hex' if target_kind=='hex' else 'base64'})")
+        else:
+            print("Target digest length: unknown (could not parse target fully)")
+
+        matched_for_this_target = False
+        steps_for_target = 0
+
+        for line_no, enc_label, preview_text, cand_bytes, cand_text in candidates:
+            m, steps = first_match_for_value(cand_bytes, cand_text, target_text, enable_noncrypto)
+            steps_for_target += steps
+            overall_total_steps += steps
+            if m:
+                any_local_matches = True
+                matched_for_this_target = True
+                print("\n=== MATCH FOUND (Local) ===")
+                print(f"Target index              : {tidx}")
+                print(f"Line number               : {line_no}")
+                print(f"Encoding used for bytes   : {enc_label}")
+                print(f"Candidate length          : {len(cand_bytes)} bytes")
+                print("Matched value (verbatim bytes): ", end=""); sys.stdout.flush()
+                sys.stdout.buffer.write(cand_bytes + b"\n")
+                print(f"Matched value (utf8/escaped)  : {repr(preview_text)}")
+                print(f"Matched value (hex)           : {binascii.hexlify(cand_bytes).decode('ascii')}")
+                print(f"Matched algorithm             : {m}")
+                print(f"Total local steps (this target): {steps_for_target}")
+                break
+
+        if not matched_for_this_target:
+            print(f"\nNo local match found for target #{tidx} after {steps_for_target} local steps.")
+
     if args.try_external:
         if not (value_path and hash_path):
             print("[external] Skipping external tools: they require file-based inputs (--valueof/--hashvalue).")
         else:
             print(f"[external] Tools enabled. hashcat={'FOUND' if tool_exists('hashcat') else 'NOT FOUND'}, john={'FOUND' if tool_exists('john') else 'NOT FOUND'}")
-            # Hashcat: try ALL modes with your files
-            hc = try_hashcat_all_modes_files(value_path, hash_path, verbose=args.external_verbose)
-            if hc:
-                _, mode_id, mode_name, plaintext = hc.split("|", 3)
-                ln = find_line_number_in_file(value_path, plaintext)
-                print("\n=== MATCH FOUND (External) ===")
-                if ln:
-                    print(f"Line number (known.txt): {ln}")
-                print(f"Matched value (plaintext): {plaintext}")
-                print(f"Matched algorithm/tool : Hashcat {mode_name} (m{mode_id})")
-                return
-            # John: try ALL formats with your files
-            jn = try_john_all_formats_files(value_path, hash_path, fork=args.john_fork, verbose=args.external_verbose)
-            if jn:
-                _, fmt, plaintext = jn.split("|", 2)
-                ln = find_line_number_in_file(value_path, plaintext)
-                print("\n=== MATCH FOUND (External) ===")
-                if ln:
-                    print(f"Line number (known.txt): {ln}")
-                print(f"Matched value (plaintext): {plaintext}")
-                tool_label = f"John format={fmt}"
-                if args.john_fork and args.john_fork > 1:
-                    tool_label += f", fork={args.john_fork}"
-                print(f"Matched algorithm/tool : {tool_label}")
-                return
 
-    # No match anywhere
-    print("\nNo match found across all candidates and exhaustive external runs.")
-    print(f"Total local steps tried: {total_steps}")
+            hc_results = try_hashcat_all_modes_files_collect(value_path, hash_path, verbose=args.external_verbose)
+            jn_results = try_john_all_formats_files_collect(value_path, hash_path, fork=args.john_fork, verbose=args.external_verbose)
+
+            if hc_results:
+                print("\n=== EXTERNAL RESULTS: Hashcat (ALL cracks) ===")
+                for h, info in hc_results.items():
+                    plain = info["plaintext"]
+                    modes = sorted(info["modes"])
+                    ln = find_line_number_in_file(value_path, plain)
+                    if ln:
+                        print(f"- {h}\n    plaintext: {plain}  (known.txt line {ln})")
+                    else:
+                        print(f"- {h}\n    plaintext: {plain}")
+                    for m_id, m_name in modes:
+                        print(f"    via: {m_name} ({m_id})")
+
+            if jn_results:
+                print("\n=== EXTERNAL RESULTS: John the Ripper (ALL cracks) ===")
+                for key, info in jn_results.items():
+                    plain = info["plaintext"]
+                    formats = sorted(info["formats"])
+                    ln = find_line_number_in_file(value_path, plain)
+                    print(f"- {key}")
+                    if ln:
+                        print(f"    plaintext: {plain}  (known.txt line {ln})")
+                    else:
+                        print(f"    plaintext: {plain}")
+                    for fmt in formats:
+                        tag = f"fork={args.john_fork}" if args.john_fork and args.john_fork > 1 else ""
+                        print(f"    via: {fmt} {tag}".rstrip())
+
+            if not hc_results and not jn_results:
+                print("\n[external] No cracks found by Hashcat or John across all modes/formats.")
+
+    print("\n" + ("="*60))
+    if any_local_matches:
+        print("Some targets were matched locally. See above per-target results.")
+    else:
+        print("No local matches found for any provided target hashes.")
+    print(f"Total local steps tried across all targets: {overall_total_steps}")
     print("Tips:")
     print("  • External runs will only work if your hash file matches each tool’s expected format (salts/fields).")
     print("  • Use --external-verbose to print every mode/format as it tries.")
